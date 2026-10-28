@@ -256,7 +256,11 @@ class ClientState(CivPropController):
         self.ws_client.send_message("/set netwait 15")
         # self.ws_client.send_message("/set nettimeout 120")
         self.ws_client.send_message("/set pingtime 30")
-        self.ws_client.send_message("/set pingtimeout 720")
+        # Keep the websocket alive while the harness waits on a long model
+        # response.  The harness supplies the value before reset; retain the
+        # upstream default for callers that do not configure it.
+        self.ws_client.send_message(
+            f"/set pingtimeout {fc_args.get('pingtimeout', 720)}")
         self.ws_client.send_message("/set threaded_save enabled")
         self.ws_client.send_message("/set scorelog enabled")
         self.ws_client.send_message("/set size 4")

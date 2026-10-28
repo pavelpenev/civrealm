@@ -19,6 +19,10 @@
 import json
 from typing import final
 import asyncio
+from collections import deque
+import hashlib
+from pathlib import Path
+import traceback
 from tornado import httpclient
 from tornado import httputil
 from tornado import websocket
@@ -29,6 +33,19 @@ APPLICATION_JSON = "application/json"
 
 DEFAULT_CONNECT_TIMEOUT = 300
 DEFAULT_REQUEST_TIMEOUT = 300
+
+
+class WebSocketWriteError(RuntimeError):
+    """A websocket write failed on the websocket's owning IOLoop.
+
+    The write is deliberately not retried: callers must treat a failure after
+    dispatch as an uncertain mutation.  ``diagnostic`` is bounded and carries
+    no payload.
+    """
+
+    def __init__(self, message, *, diagnostic=None):
+        super().__init__(message)
+        self.diagnostic = diagnostic or {}
 
 
 class WebSocketClient(object):
@@ -44,6 +61,10 @@ class WebSocketClient(object):
         self._ws_connection = None
         self._connection_closed = False
         self._io_loop = None
+        self._pending_writes = deque()
+        self._write_callback_scheduled = False
+        self._deferred_write_error = None
+        self._deferred_write_diagnostic = None
 
     @final
     def connect(self, url):
@@ -76,7 +97,9 @@ class WebSocketClient(object):
             # This happens when the connection was closed intentionally before the call to start_loop, e.g., the user pressed Ctrl+C to stop the client, or the server closed the connection.
             return
         try:
+            self._ensure_owned_asyncio_loop("start_ioloop")
             self._io_loop.start()
+            self._raise_deferred_write_error()
         except KeyboardInterrupt:
             raise KeyboardInterrupt
 
@@ -98,10 +121,44 @@ class WebSocketClient(object):
                 f"web_socket_client::send: Web socket connection has not been established."
             )
             return
+        # A caller from another thread must not be rejected merely because
+        # that thread has a different asyncio loop: the actual Tornado call
+        # is scheduled on the captured owner below.  Restore the owner only
+        # when this thread has no loop at all.
+        owned = self._owned_asyncio_loop()
+        if owned is not None and owned.is_closed():
+            raise RuntimeError("websocket asyncio loop is closed at send")
+        try:
+            current = asyncio.get_event_loop()
+        except RuntimeError:
+            current = None
+        if current is None and owned is not None:
+            asyncio.set_event_loop(owned)
+        self._raise_deferred_write_error()
         # TODO: check if we need to clear empty spaces
         msg = json.dumps(data)
-        ret_future = self._ws_connection.write_message(msg)
-        # fc_logger.debug(f'ret_future: {ret_future}')
+        try:
+            running = asyncio.get_running_loop()
+        except RuntimeError:
+            running = None
+        # Tornado's WebSocketProtocol13.write_message() calls
+        # asyncio.ensure_future() synchronously.  Calling it from CivRealm's
+        # stopped worker thread therefore fails even when that thread has the
+        # right loop installed.  Queue the *actual* call on the owning
+        # IOLoop; add_callback preserves FIFO and this path never retries.
+        if owned is not None and running is owned:
+            self._invoke_write(msg)
+        else:
+            self._pending_writes.append(msg)
+            if not self._write_callback_scheduled:
+                self._write_callback_scheduled = True
+                try:
+                    self._io_loop.add_callback(self._drain_pending_writes)
+                except BaseException as exc:
+                    self._write_callback_scheduled = False
+                    self._pending_writes.clear()
+                    self._record_write_failure(exc, "schedule")
+                    self._raise_deferred_write_error()
 
     @final
     def close(self):
@@ -109,6 +166,8 @@ class WebSocketClient(object):
         # Connection already closed.
         if self._connection_closed:
             return
+
+        self._ensure_owned_asyncio_loop("close")
             # raise RuntimeError('Web socket connection is already closed.')
 
         # print(f'Url: {self.url}')
@@ -117,10 +176,16 @@ class WebSocketClient(object):
         # print(f'loop: {hex(id(loop))}\n *******')
 
         self._connection_closed = True
+        # A queued mutation must never run during shutdown.  The callback may
+        # already be posted to the owner loop, so _drain_pending_writes also
+        # checks this flag when it executes.
+        self._pending_writes.clear()
         self._on_connection_close()
         self._ws_connection.close()
-        ioloop.IOLoop.current().stop()
-        ioloop.IOLoop.current().start()
+        # Use the loop that owns the websocket.  IOLoop.current() can refer
+        # to a different (or absent) thread-local loop after a prior RPC.
+        self._io_loop.stop()
+        self._io_loop.start()
         # ioloop.IOLoop.clear_current()
         # ioloop.IOLoop.current().close()
 
@@ -131,6 +196,149 @@ class WebSocketClient(object):
             self._on_connection_success()
         else:
             self._on_connection_error(future.exception())
+
+    def _ensure_owned_asyncio_loop(self, stage):
+        """Restore or validate the asyncio loop owned by this websocket.
+
+        CivRealm starts and stops the Tornado loop around each RPC.  Tornado
+        retains the asyncio loop it was created with, while asyncio's
+        thread-local current-loop slot may be cleared between operations.
+        Reinstall only that exact loop; never create a replacement loop for a
+        live websocket, since futures and callbacks are bound to the owner.
+        """
+        if self._io_loop is None:
+            return
+        owned = getattr(self._io_loop, "asyncio_loop", None)
+        if owned is None:
+            # Tornado versions before the public property used this private
+            # name.  Keep compatibility for those versions only.
+            owned = getattr(self._io_loop, "_asyncio_loop", None)
+        if owned is None:
+            return
+        if owned.is_closed():
+            raise RuntimeError(
+                f"websocket asyncio loop is closed at {stage}: "
+                f"{self._loop_diagnostic(owned)}")
+        try:
+            current = asyncio.get_event_loop()
+        except RuntimeError:
+            current = None
+        if current is None:
+            asyncio.set_event_loop(owned)
+            current = owned
+        if current is not owned:
+            raise RuntimeError(
+                f"websocket asyncio loop changed at {stage}: "
+                f"{self._loop_diagnostic(owned, current)}")
+
+    def _owned_asyncio_loop(self):
+        if self._io_loop is None:
+            return None
+        return (getattr(self._io_loop, "asyncio_loop", None)
+                or getattr(self._io_loop, "_asyncio_loop", None))
+
+    def _invoke_write(self, msg):
+        try:
+            result = self._ws_connection.write_message(msg)
+        except BaseException as exc:
+            self._record_write_failure(exc, "write")
+            raise WebSocketWriteError(
+                "websocket write failed", diagnostic=self._deferred_write_diagnostic
+            ) from exc
+        # Tornado normally returns a Future.  Observe asynchronous failures
+        # too; an exception in this callback stops the owning loop and is
+        # surfaced by start_ioloop after it returns.
+        add_done_callback = getattr(result, "add_done_callback", None)
+        if callable(add_done_callback):
+            try:
+                add_done_callback(self._write_future_done)
+            except BaseException as exc:
+                # The write already crossed the transport boundary; callback
+                # registration failure is therefore uncertain and must not
+                # cause a replay.
+                self._record_write_failure(exc, "write_callback")
+                raise WebSocketWriteError(
+                    "websocket write callback registration failed",
+                    diagnostic=self._deferred_write_diagnostic,
+                ) from exc
+            # Some test doubles and transports can return an already-failed
+            # Future.  Observe it synchronously so a queued FIFO tail is
+            # abandoned before the next message is invoked.
+            done = getattr(result, "done", None)
+            if callable(done) and done():
+                self._write_future_done(result)
+        return result
+
+    def _write_future_done(self, future):
+        try:
+            future.result()
+        except BaseException as exc:
+            self._record_write_failure(exc, "write_future")
+            owner = self._owned_asyncio_loop()
+            if owner is not None and owner.is_running():
+                owner.stop()
+
+    def _drain_pending_writes(self):
+        self._write_callback_scheduled = False
+        if self._connection_closed:
+            self._pending_writes.clear()
+            return
+        while self._pending_writes and self._deferred_write_error is None:
+            msg = self._pending_writes.popleft()
+            try:
+                self._invoke_write(msg)
+            except BaseException:
+                # The message was removed before invocation: it is never
+                # replayed.  Pending messages are abandoned because their
+                # execution order is no longer provable.
+                self._pending_writes.clear()
+                owner = self._owned_asyncio_loop()
+                if owner is not None and owner.is_running():
+                    owner.stop()
+                return
+
+    def _record_write_failure(self, exc, stage):
+        if self._deferred_write_error is not None:
+            return
+        owned = self._owned_asyncio_loop()
+        self._deferred_write_error = exc
+        self._pending_writes.clear()
+        self._deferred_write_diagnostic = {
+            "stage": stage,
+            "exception": type(exc).__name__,
+            "message": str(exc)[:512],
+            "traceback": "".join(traceback.format_exception(
+                type(exc), exc, exc.__traceback__, limit=8))[-4096:],
+            "owned_loop": self._loop_diagnostic(owned),
+        }
+        try:
+            source = Path(__file__).resolve()
+            self._deferred_write_diagnostic["vendor_module"] = str(source)
+            self._deferred_write_diagnostic["vendor_module_sha256"] = hashlib.sha256(
+                source.read_bytes()).hexdigest()
+        except Exception:
+            # Provenance is useful but must never mask the transport failure.
+            pass
+
+    def _raise_deferred_write_error(self):
+        exc = self._deferred_write_error
+        if exc is None:
+            return
+        raise WebSocketWriteError(
+            "deferred websocket write failed",
+            diagnostic=self._deferred_write_diagnostic,
+        ) from exc
+
+    @staticmethod
+    def _loop_diagnostic(owned, current=None):
+        """Return bounded loop state useful for failure artifacts."""
+        def state(loop):
+            if loop is None:
+                return None
+            return {"id": hex(id(loop)),
+                    "closed": bool(loop.is_closed()),
+                    "running": bool(loop.is_running())}
+        return {"owned": state(owned), "current": state(current)}
 
     def _on_message(self, message):
         """This is called when new message is available from the server.

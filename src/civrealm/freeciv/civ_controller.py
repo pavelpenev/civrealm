@@ -710,7 +710,8 @@ class CivController(CivPropController):
             raise RuntimeError(
                 f'The loaded game is saved by another user: {load_username}. Your username is {self.clstate.username}.')
         self.ws_client.send_message(f'/load {save_name}')
-        self.ws_client.send_message('/set pingtimeout 720')
+        self.ws_client.send_message(
+            f"/set pingtimeout {fc_args.get('pingtimeout', 720)}")
         self.ws_client.send_message(f"/set victories {fc_args['victories']}")
         self.ws_client.send_message(f"/set endvictory {fc_args['endvictory']}")
         self.ws_client.send_message(f"/set advisor {fc_args['advisor']}")
