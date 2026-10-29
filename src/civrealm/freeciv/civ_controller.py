@@ -761,6 +761,12 @@ class CivController(CivPropController):
         leader_name = pplayer['name']
         if pplayer['flags'][player_const.PLRF_AI] > 0:
             leader_name = pnation['leader_name'][0]
+        elif fc_args.get('player_name'):
+            # Keep the protocol username/save prefix separate from the visible
+            # ruler name.  The harness may provide a display name containing
+            # spaces (for example, "Le Chonk"); this field is only used for
+            # the human player's fresh-game nation selection packet.
+            leader_name = fc_args['player_name']
         # China id is 107
         # chosen_nation_name = 107
         packet = {"pid": packet_nation_select_req,
